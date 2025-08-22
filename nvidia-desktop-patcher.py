@@ -50,12 +50,6 @@ COMMON_APPS_BASE = [
 ALLOW_SHORT_KEYWORDS = {'qq'}  # 允许的短关键字白名单
 
 def _should_patch_exec(exec_cmd: str, keywords) -> bool:
-    """基于更安全的 token 判断是否需要注入，避免如 'et' 命中 'center' 的误报。
-    规则：
-    - 使用 shlex.split 解析 Exec 字符串为 token（忽略 %f/%u 等字段代码）。
-    - 跳过 env 与 VAR= 形式的前缀赋值。
-    - 针对前若干实际命令 token 做包含匹配（关键字长度>=3，或在白名单 ALLOW_SHORT_KEYWORDS）。
-    """
     try:
         # 删除字段代码，保留原次序
         parts = [p for p in shlex.split(exec_cmd) if not p.startswith('%')]
