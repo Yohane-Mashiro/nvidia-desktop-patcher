@@ -5,6 +5,60 @@ import sys
 import shutil
 import subprocess
 import shlex
+from typing import Callable, List, Tuple
+
+
+def safe_edit_file(path: str,
+                   mutator: Callable[[List[str]], Tuple[List[str], bool]],
+                   backup: bool = False,
+                   action: str = 'Updated') -> bool:
+    """通用文件编辑器：读取 -> 变更 -> 写回。
+
+    参数:
+    - path: 目标文件路径
+    - mutator: 接收原始行列表，返回 (新行列表, 是否变更)
+    - backup: 是否在写入前生成 .bak 备份（若不存在）
+    - action: 变更时打印的动作名称
+
+    返回:
+    - bool: 是否发生变更并写回成功
+    """
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+    except (FileNotFoundError, PermissionError) as e:
+        print(f'Skip {path}: {e}')
+        return False
+    except Exception as e:
+        print(f'Failed to read {path}: {e}')
+        return False
+
+    try:
+        new_lines, changed = mutator(lines)
+    except Exception as e:
+        print(f'Mutation error on {path}: {e}')
+        return False
+
+    if not changed:
+        return False
+
+    if backup:
+        try:
+            bak = path + '.bak'
+            if not os.path.exists(bak):
+                shutil.copy2(path, bak)
+        except Exception as e:
+            # 备份失败不应阻止写入，但给出提示
+            print(f'Warning: 备份失败 {path} -> {e}')
+
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            f.writelines(new_lines)
+        print(f'{action}: {path}')
+        return True
+    except Exception as e:
+        print(f'Failed to write {path}: {e}')
+        return False
 
 PRIME_ENV = 'env __NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia'
 DESKTOP_DIRS = [
@@ -81,28 +135,19 @@ def _should_patch_exec(exec_cmd: str, keywords) -> bool:
     return False
 
 def patch_desktop_file(path, keywords):
-    try:
-        with open(path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-    except (FileNotFoundError, PermissionError) as e:
-        print(f'Skip {path}: {e}')
-        return
-    changed = False
-    for i, line in enumerate(lines):
-        if line.startswith('Exec=') and PRIME_ENV not in line:
-            exec_cmd = line[len('Exec='):].strip()
-            if _should_patch_exec(exec_cmd, keywords):
-                # 避免重复添加
-                if not exec_cmd.startswith(PRIME_ENV):
-                    lines[i] = f'Exec={PRIME_ENV} {exec_cmd}\n'
-                    changed = True
-    if changed:
-        try:
-            with open(path, 'w', encoding='utf-8') as f:
-                f.writelines(lines)
-            print(f'Patched: {path}')
-        except Exception as e:
-            print(f'Failed to write {path}: {e}')
+    def _mutator(lines: List[str]) -> Tuple[List[str], bool]:
+        changed = False
+        for i, line in enumerate(lines):
+            if line.startswith('Exec=') and PRIME_ENV not in line:
+                exec_cmd = line[len('Exec='):].strip()
+                if _should_patch_exec(exec_cmd, keywords):
+                    # 避免重复添加
+                    if not exec_cmd.startswith(PRIME_ENV):
+                        lines[i] = f'Exec={PRIME_ENV} {exec_cmd}\n'
+                        changed = True
+        return lines, changed
+
+    safe_edit_file(path, _mutator, backup=False, action='Patched')
 
 def _strip_prime_prefix_from_exec(line: str) -> str:
     """若 Exec 行包含 PRIME 前缀则移除，否则原样返回。"""
@@ -116,27 +161,17 @@ def _strip_prime_prefix_from_exec(line: str) -> str:
 
 def rollback_desktop_file(path: str) -> bool:
     """从单个 .desktop 的 Exec 行移除 PRIME 前缀。返回是否有修改。"""
-    try:
-        with open(path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-    except (FileNotFoundError, PermissionError) as e:
-        print(f'Skip {path}: {e}')
-        return False
-    changed = False
-    for i, line in enumerate(lines):
-        new_line = _strip_prime_prefix_from_exec(line)
-        if new_line != line:
-            lines[i] = new_line
-            changed = True
-    if changed:
-        try:
-            with open(path, 'w', encoding='utf-8') as f:
-                f.writelines(lines)
-            print(f'Rolled back: {path}')
-        except Exception as e:
-            print(f'Failed to write {path}: {e}')
-            return False
-    return changed
+    def _mutator(lines: List[str]) -> Tuple[List[str], bool]:
+        changed = False
+        new_lines: List[str] = []
+        for line in lines:
+            new_line = _strip_prime_prefix_from_exec(line)
+            if new_line != line:
+                changed = True
+            new_lines.append(new_line)
+        return new_lines, changed
+
+    return safe_edit_file(path, _mutator, backup=False, action='Rolled back')
 
 def has_nvidia_dgpu() -> bool:
     """尽量无依赖地检测是否存在 NVIDIA 独显及驱动。
@@ -192,40 +227,21 @@ def patch_session_inplace(src_path: str, want: str):
     """直接在系统会话 .desktop 中原地写入（先备份 .bak）。
     want: 'gnome'|'kde'|'both'
     """
-    try:
-        with open(src_path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-    except (FileNotFoundError, PermissionError) as e:
-        print(f'Skip {src_path}: {e}')
-        return
+    def _mutator(lines: List[str]) -> Tuple[List[str], bool]:
+        sess = _classify_session(lines)
+        if want != 'both' and sess != want:
+            return lines, False
+        changed = False
+        new_lines = list(lines)
+        for i, line in enumerate(new_lines):
+            if line.startswith('Exec=') and PRIME_ENV not in line:
+                exec_cmd = line[len('Exec='):].strip()
+                if not exec_cmd.startswith(PRIME_ENV):
+                    new_lines[i] = f'Exec={PRIME_ENV} {exec_cmd}\n'
+                    changed = True
+        return new_lines, changed
 
-    sess = _classify_session(lines)
-    if want != 'both' and sess != want:
-        return
-
-    changed = False
-    new_lines = list(lines)
-    for i, line in enumerate(new_lines):
-        if line.startswith('Exec=') and PRIME_ENV not in line:
-            exec_cmd = line[len('Exec='):].strip()
-            if not exec_cmd.startswith(PRIME_ENV):
-                new_lines[i] = f'Exec={PRIME_ENV} {exec_cmd}\n'
-                changed = True
-
-    if changed:
-        # 先备份
-        try:
-            backup = src_path + '.bak'
-            if not os.path.exists(backup):
-                shutil.copy2(src_path, backup)
-        except Exception as e:
-            print(f'Warning: 备份失败 {src_path} -> {e}')
-        try:
-            with open(src_path, 'w', encoding='utf-8') as f:
-                f.writelines(new_lines)
-            print(f'Patched session (inplace): {src_path}')
-        except Exception as e:
-            print(f'Failed to write session inplace {src_path}: {e}')
+    safe_edit_file(src_path, _mutator, backup=True, action='Patched session (inplace)')
 
 
 def _session_file_contains_prime(path: str) -> bool:
